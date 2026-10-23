@@ -1,0 +1,317 @@
+---
+title: "Site-Adjusted AD Association of Predicted Phenotypes"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# ---- GNPC code release ---------------------------------------------------------
+# Part of: Fig. 4f-g (GNPC statistics), Extended Data Fig. 4, Supplementary Table 7.
+# Makes: site-adjusted association (regression with contributor_code as covariate) of
+#   each predicted phenotype with AD status in GNPC, pooled plasma and pooled CSF/serum.
+# Inputs:  PROTEOMICS_RDS and PREDICTED_RDS (set in config.R).
+# Outputs: step_dir("02_ad_assoc_site_adjusted").
+# Runs on the AD Workbench (the GNPC data stay there). From the repository root:
+#   Rscript -e 'rmarkdown::render("02_ad_association/02_ad_assoc_site_adjusted.Rmd", knit_root_dir = getwd())'
+# ---------------------------------------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+source("config.R")
+```
+
+## Introduction
+
+This document estimates the association of each predicted phenotype with AD status, adjusted for contributing site, in pooled plasma and pooled CSF/serum samples.
+
+## Setup
+
+First, we'll load the required libraries and the settings.
+
+```{r load-libraries}
+library(dplyr)
+library(data.table)
+library(pROC)
+library(ggplot2)
+library(tidyverse)
+library(PRROC)  # For precision-recall curves
+library(SummarizedExperiment)
+```
+
+## Data Preparation
+
+Load and prepare the proteomics data and prediction results.
+
+```{r load-data}
+# Load proteomics data
+expdata <- readRDS(PROTEOMICS_RDS)
+metadata <- colData(expdata) %>% as.data.frame()
+
+# Load prediction data
+pp <- read_predicted_phenotypes(PREDICTED_RDS)
+prediction <- get_prediction(pp, "full")
+
+indx = colnames(prediction)%in%c(colnames(prediction)%>%.[grepl("class",.)]%>%gsub("_class.+","",.))
+prediction = prediction[,!indx]
+# Join metadata and prediction data
+data <- metadata %>%
+  inner_join(prediction, by = "sample_id")
+
+data = data%>%
+  filter(!contributor_code%in%EXCLUDED_CONTRIBUTORS)
+data$contributor_code = paste0(data$contributor_code,"_",data$sample_matrix)
+
+data$control =  !rowAnys(data%>%
+    select(all_of(c("pd", "als", "ad", "ftd", "stroke")))%>%
+    as.matrix() == "1")
+
+
+```
+
+## Define Analysis Parameters
+
+Identify predictor columns and targets of interest.
+
+```{r define-parameters}
+
+# Identify predictor columns: every predicted-phenotype column, in file order
+predictor_names <- intersect(names(data), setdiff(names(prediction), "sample_id"))
+predictor_names = setdiff(predictor_names,predictor_names%>%.[grepl("class",.)]%>%gsub("_class.+","",.)%>%unique())
+# Define targets of interest (AD only here)
+targets <- c("pd", "als", "ad", "ftd", "stroke")[c(3)]  # AD
+```
+
+## Define Contributor Filters
+
+We define two sample groups: pooled plasma and pooled CSF/serum.
+
+```{r define-filters}
+# Unique contributor codes (not used below; no contributor is excluded here)
+exclude_contributors = NULL
+unique_contributors <- unique(data$contributor_code)
+
+# Create a list of filters to apply
+# all_plasma = pooled plasma; all_csf = pooled CSF and serum
+filter_groups <- list(
+  all_plasma = function(data) filter(data, !contributor_code %in% c("Q_CSF","U_Serum", "N_CSF","T_CSF")),
+  all_csf = function(data) filter(data, contributor_code %in% c("Q_CSF","U_Serum", "N_CSF","T_CSF"))
+)
+
+```
+
+## Define Metric Functions
+### Regression Statistics Function
+
+```{r regression-stats-function}
+# Function to calculate regression statistics for a single target and predictor
+calculate_regression_stats <- function(data, target, predictor, filter_name, filter_func) {
+  # Handle data preparation - apply the filter function
+  model_data <- filter_func(data) %>%
+    select(all_of(c(target, predictor,"control","contributor_code"))) %>%
+    mutate(across(all_of(target), ~ replace(.x, .x == -1, NA))) %>%
+    drop_na()%>%
+    filter((!!sym(target) == 0 & control) | !!sym(target) == 1)%>%
+    dplyr::select(-control)
+  
+  # Skip if there's not enough data
+  if(nrow(model_data) < 10) {
+    return(tibble(
+      filter_group = filter_name,
+      target = target,
+      predictor = predictor,
+      beta = NA_real_,
+      std_error = NA_real_,
+      test_statistic = NA_real_,
+      test_type = NA_character_,
+      df_residual = NA_real_,
+      ci_low = NA_real_,
+      ci_high = NA_real_,
+      odds_ratio = NA_real_,
+      or_ci_low = NA_real_,
+      or_ci_high = NA_real_,
+      p_value = NA_real_,
+      regression_type = NA_character_,
+      n = nrow(model_data)
+    ))
+  }
+  
+    # Standardize variables (z-scoring)
+  # For binary targets, only standardize the predictor
+  model_data <- model_data %>%
+      mutate(across(all_of(predictor), ~ scale(.x)[,1]))
+
+  
+  # Run regression
+  tryCatch({
+    # For binary targets, use logistic regression
+        if(all(model_data[[target]] %in% c(0, 1))) {
+      # Convert target to numeric to be sure
+      model_data[[target]] <- as.numeric(as.character(model_data[[target]]))
+      
+      # Fit logistic regression model
+      model <- glm(
+        formula = as.formula(paste(target, "~", predictor,"+contributor_code")), 
+        family = binomial(link = "logit"), 
+        data = model_data
+      )
+      
+      # Extract coefficients
+      coef_summary <- summary(model)$coefficients
+      
+      # Extract beta and p-value for the predictor
+      beta <- coef_summary[predictor, "Estimate"]
+      std_error <- coef_summary[predictor, "Std. Error"]
+      z_value <- coef_summary[predictor, "z value"]
+      p_value <- coef_summary[predictor, "Pr(>|z|)"]
+
+      # Confidence intervals (Wald-based for speed)
+      ci_low <- beta - 1.96 * std_error
+      ci_high <- beta + 1.96 * std_error
+
+      # Effect size: odds ratio with CI
+      odds_ratio <- exp(beta)
+      or_ci_low <- exp(ci_low)
+      or_ci_high <- exp(ci_high)
+
+      # Degrees of freedom (residual)
+      df_residual <- model$df.residual
+
+      # Return the regression metrics
+      tibble(
+        filter_group = filter_name,
+        target = target,
+        predictor = predictor,
+        beta = beta,
+        std_error = std_error,
+        test_statistic = z_value,
+        test_type = "z",
+        df_residual = df_residual,
+        ci_low = ci_low,
+        ci_high = ci_high,
+        odds_ratio = odds_ratio,
+        or_ci_low = or_ci_low,
+        or_ci_high = or_ci_high,
+        p_value = p_value,
+        regression_type = "logistic",
+        n = nrow(model_data)
+      )
+    } else {
+      # For continuous targets, use linear regression
+      model <- lm(
+        formula = as.formula(paste(target, "~", predictor)), 
+        data = model_data
+      )
+      
+      # Extract coefficients
+      coef_summary <- summary(model)$coefficients
+      
+      # Extract beta and p-value for the predictor
+      beta <- coef_summary[predictor, "Estimate"]
+      std_error <- coef_summary[predictor, "Std. Error"]
+      t_value <- coef_summary[predictor, "t value"]
+      p_value <- coef_summary[predictor, "Pr(>|t|)"]
+
+      # Degrees of freedom and confidence intervals
+      df_residual <- model$df.residual
+      ci_low <- beta - qt(0.975, df_residual) * std_error
+      ci_high <- beta + qt(0.975, df_residual) * std_error
+
+      # Return the regression metrics
+      tibble(
+        filter_group = filter_name,
+        target = target,
+        predictor = predictor,
+        beta = beta,
+        std_error = std_error,
+        test_statistic = t_value,
+        test_type = "t",
+        df_residual = df_residual,
+        ci_low = ci_low,
+        ci_high = ci_high,
+        odds_ratio = NA_real_,
+        or_ci_low = NA_real_,
+        or_ci_high = NA_real_,
+        p_value = p_value,
+        regression_type = "linear",
+        n = nrow(model_data)
+      )
+    }
+  }, error = function(e) {
+    # Return NAs if calculation fails
+    tibble(
+      filter_group = filter_name,
+      target = target,
+      predictor = predictor,
+      beta = NA_real_,
+      std_error = NA_real_,
+      test_statistic = NA_real_,
+      test_type = NA_character_,
+      df_residual = NA_real_,
+      ci_low = NA_real_,
+      ci_high = NA_real_,
+      odds_ratio = NA_real_,
+      or_ci_low = NA_real_,
+      or_ci_high = NA_real_,
+      p_value = NA_real_,
+      regression_type = NA_character_,
+      n = nrow(model_data),
+      error = as.character(e)
+    )
+  })
+}
+```
+
+## Calculate Statistics
+
+Now we'll calculate statistics for each combination of target, predictor, and filter group.
+
+```{r calculate-stats}
+# Create all combinations of targets, predictors, and filter groups
+all_combinations <- crossing(
+  target = targets,
+  predictor = predictor_names,
+  filter_info = map(names(filter_groups), function(name) list(name = name, func = filter_groups[[name]]))
+)
+
+# Calculate regression statistics for each combination
+regression_stats <- pmap_dfr(
+  all_combinations,
+  function(target, predictor, filter_info) {
+    calculate_regression_stats(data, target, predictor, filter_info$name, filter_info$func)
+  }
+)
+
+# Combine the statistics - retain all columns (test statistic, df, 95% CI)
+all_stats <- regression_stats %>%
+  dplyr::select(filter_group, target, predictor, regression_type,
+                beta, std_error, test_statistic, test_type,
+                df_residual, ci_low, ci_high,
+                odds_ratio, or_ci_low, or_ci_high,
+                p_value, n)
+```
+
+## Save Results
+
+Save the results for future use.
+
+```{r save-results}
+# Save the full statistics results
+output_dir <- step_dir("02_ad_assoc_site_adjusted")
+saveRDS(all_stats, file.path(output_dir, "all_predictor_by_contributor_stats.rds"))
+write.csv(all_stats, file.path(output_dir, "all_predictor_by_contributor_stats.csv"), 
+          row.names = FALSE)
+
+```
+
+## Session Information
+
+The following section provides information about the R session used for this analysis, including the R version, operating system, and loaded packages. This information is essential for reproducibility.
+
+```{r session-info}
+# Display session information
+sessionInfo()
+```

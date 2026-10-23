@@ -1,0 +1,9 @@
+# rendered R Markdown output (written next to each .Rmd)
+*.html
+*_files/
+*_cache/
+.Rhistory
+.RData
+# written by graphics devices and CatBoost when scripts run from the repo root
+Rplots.pdf
+catboost_info/

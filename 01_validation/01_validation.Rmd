@@ -1,0 +1,1102 @@
+---
+title: "Validation of Predicted Sex, APOE, Age and MMSE in GNPC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# ---- GNPC code release ---------------------------------------------------------
+# Makes: Fig. 4a-e and Extended Data Fig. 2-3 -- validation of the predicted sex,
+#   APOE genotype, age and MMSE against the measured values in GNPC, by site and
+#   by tissue (plasma / CSF), with summary statistics.
+# Inputs:  PROTEOMICS_RDS and PREDICTED_RDS (set in config.R).
+# Outputs: step_dir("01_validation").
+# Runs on the AD Workbench (the GNPC data stay there). From the repository root:
+#   Rscript -e 'rmarkdown::render("01_validation/01_validation.Rmd", knit_root_dir = getwd())'
+# ---------------------------------------------------------------------------------
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 8
+)
+
+# Load all required packages in one place
+required_packages <- c(
+  "dplyr", "data.table", "pROC", "ggplot2", "tidyverse", 
+  "PRROC", "SummarizedExperiment", "scales", "gridExtra", 
+  "reshape2", "corrplot", "grid", "viridis", "ggpubr"
+)
+
+# Install missing packages
+new_packages <- required_packages[!required_packages %in% installed.packages()[,"Package"]]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load all packages
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+source("config.R")
+
+# Create results directory if it doesn't exist
+output_dir <- paste0(step_dir("01_validation"), "/")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Introduction
+
+This document compares predicted and measured values across contributor groups (sites) and tissues. We calculate accuracy and confusion matrices for the classifications, and correlation and error statistics for the continuous measures, for four predicted measures:
+
+1. Sex
+2. APOE genotype
+3. Age
+4. Mini-Mental State Exam (MMSE) score
+
+## Helper Functions
+
+First, let's define some helper functions to avoid code repetition and improve readability.
+
+```{r helper-functions}
+# Function to format contributor labels
+format_contributor_label <- function(code) {
+  sample_type <- gsub(".+ ", "", gsub(".+_", "", code))
+  contributor <- gsub("_.+", "", code)
+  return(paste0(sample_type, " (", contributor, ")"))
+}
+
+# Function to create tissue labels
+create_tissue_label <- function(contributor_label) {
+  tissue <- gsub(" \\(.+", "", contributor_label)
+  return(factor(tissue, levels = c("Plasma", "CSF")))
+}
+
+# Function to calculate regression statistics
+calc_regression_stats <- function(actual, predicted) {
+  abs_error <- abs(predicted - actual)
+  rmse <- sqrt(mean((predicted - actual)^2, na.rm = TRUE))
+  mae <- mean(abs_error, na.rm = TRUE)
+  return(list(rmse = rmse, mae = mae))
+}
+
+# Function for creating comparison scatter plots
+create_comparison_plot <- function(data, x_var, y_var, x_label, y_label, title, subtitle = NULL) {
+  stats_by_contributor <- data %>%
+    group_by(contributor_label) %>%
+    summarize(
+      rmse = sqrt(mean((!!sym(y_var) - !!sym(x_var))^2, na.rm = TRUE)),
+      mae = mean(abs(!!sym(y_var) - !!sym(x_var)), na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  p <- ggplot(data, aes(x = !!sym(x_var), y = !!sym(y_var))) +
+    geom_point(size = 0.8, alpha = 0.2, color = "gray30") +
+    geom_bin_2d(bins = 40, alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", size = 0.5) +
+    geom_smooth(method = "lm", color = "#0072B2", fill = "#0072B240", size = 1) +
+    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", 
+             size = 3, color = "black", digits = 2) +
+    geom_text(
+      data = stats_by_contributor,
+      aes(label = sprintf("RMSE: %.2f\nMAE: %.2f", rmse, mae)),
+      x = Inf, y = -Inf, hjust = 1.1, vjust = -0.8,
+      size = 2.5, color = "black", inherit.aes = FALSE
+    ) +
+    facet_wrap(~ contributor_label, scales = "free", ncol = 4) +
+    scale_fill_viridis_c(option = "mako", name = "Count", direction = -1) +
+    scale_x_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+    scale_y_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "gray90", size = 0.2),
+      panel.border = element_rect(color = "gray70", fill = NA, size = 0.5),
+      strip.background = element_rect(fill = "gray95", color = "gray70"),
+      strip.text = element_text(face = "bold", size = 11),
+      legend.position = "right",
+      legend.title = element_text(face = "bold"),
+      legend.key.size = unit(0.8, "lines"),
+      legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+      legend.box.margin = margin(t = -10),
+      axis.title = element_text(face = "bold", size = 12),
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      plot.caption = element_text(hjust = 0, size = 9, face = "italic"),
+      plot.margin = margin(t = 10, r = 15, b = 10, l = 10)
+    ) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = x_label,
+      y = y_label,
+      caption = "Note: Dashed line represents perfect prediction (y=x). Blue line shows linear regression with 95% confidence interval.
+      RMSE = Root Mean Square Error; MAE = Mean Absolute Error. Higher density of observations shown in darker colors."
+    )
+  
+  return(p)
+}
+
+create_comparison_plot <- function(data, x_var, y_var, x_label, y_label, title, subtitle = NULL) {
+  stats_by_contributor <- data %>%
+    group_by(contributor_label) %>%
+    summarize(
+      rmse = sqrt(mean((!!sym(y_var) - !!sym(x_var))^2, na.rm = TRUE)),
+      mae = mean(abs(!!sym(y_var) - !!sym(x_var)), na.rm = TRUE),
+      n = n(),  # Add sample size calculation
+      .groups = "drop"
+    )
+  
+  p <- ggplot(data, aes(x = !!sym(x_var), y = !!sym(y_var))) +
+    geom_point(size = 0.8, alpha = 0.2, color = "gray30") +
+    geom_bin_2d(bins = 40, alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", size = 0.5) +
+    geom_smooth(method = "lm", color = "#0072B2", fill = "#0072B240", size = 1) +
+    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", 
+             size = 3, color = "black", digits = 2) +
+    geom_text(
+      data = stats_by_contributor,
+      aes(label = sprintf("n = %d\nRMSE: %.2f\nMAE: %.2f", n, rmse, mae)),  # Add n to the label
+      x = Inf, y = -Inf, hjust = 1.1, vjust = -0.8,
+      size = 2.5, color = "black", inherit.aes = FALSE
+    ) +
+    facet_wrap(~ contributor_label, scales = "free", ncol = 4) +
+    scale_fill_viridis_c(option = "mako", name = "Count", direction = -1) +
+    scale_x_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+    scale_y_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "gray90", size = 0.2),
+      panel.border = element_rect(color = "gray70", fill = NA, size = 0.5),
+      strip.background = element_rect(fill = "gray95", color = "gray70"),
+      strip.text = element_text(face = "bold", size = 11),
+      legend.position = "right",
+      legend.title = element_text(face = "bold"),
+      legend.key.size = unit(0.8, "lines"),
+      legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+      legend.box.margin = margin(t = -10),
+      axis.title = element_text(face = "bold", size = 12),
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      plot.caption = element_text(hjust = 0, size = 9, face = "italic"),
+      plot.margin = margin(t = 10, r = 15, b = 10, l = 10)
+    ) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = x_label,
+      y = y_label,
+      caption = "Note: Dashed line represents perfect prediction (y=x). Blue line shows linear regression with 95% confidence interval.
+      RMSE = Root Mean Square Error; MAE = Mean Absolute Error. Higher density of observations shown in darker colors."
+    )
+  
+  return(p)
+}
+
+# Function to save plot with standard settings
+save_plot <- function(plot, filename, width = 12, height = 10,...) {
+  ggsave(
+    filename = file.path(output_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    bg = "white",...
+  )
+}
+```
+
+## Data Loading and Preparation
+
+Now we'll load the proteomics data and prediction results.
+
+```{r load-data}
+# Load proteomics data
+expdata_path <- PROTEOMICS_RDS
+if (!file.exists(expdata_path)) {
+  stop(paste("Proteomics data file not found at:", expdata_path))
+}
+expdata <- readRDS(expdata_path)
+metadata <- colData(expdata) %>% as.data.frame()
+
+# Load prediction data
+prediction_path <- PREDICTED_RDS
+if (!file.exists(prediction_path)) {
+  stop(paste("Prediction data file not found at:", prediction_path))
+}
+pp <- read_predicted_phenotypes(prediction_path)
+prediction <- get_prediction(pp, "no_class_labels")
+
+# Join metadata and prediction data
+data <- metadata %>%
+  inner_join(prediction, by = "sample_id")
+
+# Drop the excluded contributors (config.R)
+data <- data %>%
+  filter(!contributor_code %in% EXCLUDED_CONTRIBUTORS)
+
+# Add sample matrix to contributor code for more detailed analysis
+data$contributor_code <- paste0(data$contributor_code, "_", data$sample_matrix)
+
+# Create control flag
+data$control <- !rowAnys(data %>%
+  select(all_of(c("pd", "als", "ad", "ftd", "stroke"))) %>%
+  as.matrix() == "1")
+
+# Filter APOE data
+apoe_data <- data %>%
+  filter(!is.na(APOE)) %>%
+  filter(APOE != "-1")
+
+# Standardize APOE genotype order (e.g., "32" becomes "23")
+data$APOE[data$APOE %in% "32"] <- "23"
+```
+
+## Sex Analysis
+
+Next, we'll analyze SEX prediction accuracy across different contributors.
+
+```{r load-sex-predictions}
+# Predicted sex (class labels of T0002)
+sex_predictions <- get_class_labels(pp, "T0002")
+
+# Calculate sex prediction accuracy by contributor
+sex_acc_by_contributor <- data %>%
+  select(sample_id, sex, contributor_code) %>%
+  inner_join(sex_predictions, by = "sample_id") %>%
+  filter(!is.na(sex)) %>%
+  filter(sex != "-1") %>%
+  mutate(sex=2-sex)%>%
+  group_by(contributor_code) %>%
+  summarise(ACC = sum(sex == prediction) / n())
+
+print("SEX Prediction Accuracy by Contributor:")
+print(sex_acc_by_contributor)
+```
+
+
+### SEX Confusion Matrix Analysis
+
+Let's create comprehensive confusion matrices to visualize SEX prediction accuracy.
+
+```{r sex-confusion-matrices}
+# Create the confusion matrix dataframe
+conf_norm_df <- data %>%
+  select(sample_id, sex, contributor_code) %>%
+  inner_join(sex_predictions, by = "sample_id") %>%
+  filter(!is.na(sex)) %>%
+  filter(sex != "-1") %>%
+  dplyr::rename(Actual = sex, Predicted = prediction) %>%
+  group_by(contributor_code, Actual, Predicted) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(Actual, contributor_code) %>%
+  mutate(Normalized = Count / sum(Count)) %>%
+  ungroup()
+
+class_names <- unique(conf_norm_df$Actual)
+
+# Convert to factors with the right order
+conf_norm_df$Actual <- factor(conf_norm_df$Actual, levels = class_names)
+conf_norm_df$Predicted <- factor(2-conf_norm_df$Predicted, levels = class_names)
+
+# Create a complete grid with all combinations
+all_combinations <- expand.grid(
+  Actual = levels(conf_norm_df$Actual),
+  Predicted = levels(conf_norm_df$Actual),
+  contributor_code = unique(conf_norm_df$contributor_code),
+  stringsAsFactors = FALSE
+)
+
+# Convert to tibble for easier manipulation
+all_combinations <- as_tibble(all_combinations)
+
+# Join with existing data
+complete_conf_df <- left_join(
+  all_combinations,
+  conf_norm_df %>% select(Actual, Predicted, contributor_code, Count),
+  by = c("Actual", "Predicted", "contributor_code")
+)
+
+# Replace NA values with zeros for Count
+complete_conf_df <- complete_conf_df %>%
+  mutate(Count = ifelse(is.na(Count), 0, Count)) %>%
+  group_by(Actual, contributor_code) %>%
+  mutate(Normalized = Count / sum(Count)) %>%
+  ungroup() %>%
+  mutate(Normalized = replace(Normalized, is.na(Normalized), 0))
+
+# Sex code mapping for more readable labels (GNPC: 1 = male, 2 = female; the
+# predicted labels were converted to the same coding above with 2 - prediction)
+apoe_map <- c(
+  "1" = "Male",
+  "2" = "Female"
+)
+
+# Apply the mapping
+complete_conf_df$Actual <- apoe_map[complete_conf_df$Actual]
+complete_conf_df$Predicted <- apoe_map[complete_conf_df$Predicted]
+
+# Format contributor codes for readability
+complete_conf_df$contributor_code <- complete_conf_df$contributor_code %>%
+  gsub(".+ ", "", .) %>%
+  gsub(".+_", "", .) %>%
+  paste0(., " (", complete_conf_df$contributor_code %>% gsub("_.+", "", .), ")")
+
+# Calculate accuracy per contributor
+accuracy_df <- complete_conf_df %>%
+  group_by(contributor_code) %>%
+  summarise(
+    Correct = sum(Count[Actual == Predicted]),
+    Total = sum(Count),
+    Accuracy = Correct / Total,
+    .groups = "drop"
+  )
+
+# Set color palette
+color_palette <- "Blues"
+complete_conf_df = complete_conf_df %>% filter(!grepl("Serum",contributor_code))
+```
+
+### SEX Confusion Matrix Visualization
+
+Now let's visualize the confusion matrices by contributor and tissue type.
+
+```{r sex-confusion-matrix-plots}
+# Create ordered factor for proper display order
+contributor_levels <- c(
+  complete_conf_df$contributor_code %>% unique() %>% .[grepl("Plasma", .)],
+  complete_conf_df$contributor_code %>% unique() %>% .[grepl("CSF", .)]
+)
+
+# Create plot by contributor with n and accuracy in the facet labels
+norm_plot_by_contributor <- ggplot(
+  complete_conf_df%>%mutate(contributor_code = factor(contributor_code, levels = contributor_levels)),
+  aes(x = Predicted, y = Actual, fill = Normalized)
+) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", Normalized), 
+                color = ifelse(Normalized > 0.5, "white", "black")), 
+            size = 4) +
+  scale_fill_distiller(palette = color_palette, direction = 1, labels = percent_format()) +
+  scale_color_identity() +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 10)
+  ) +
+  labs(
+    title = "Row-Normalized Confusion Matrix (Recall Perspective)",
+    x = "Predicted sex",
+    y = "Actual sex",
+    fill = "Proportion"
+  ) +
+  facet_wrap(~contributor_code, labeller = labeller(contributor_code = function(x) {
+    acc <- accuracy_df$Accuracy[match(x, accuracy_df$contributor_code)]
+    n <- accuracy_df$Total[match(x, accuracy_df$contributor_code)]
+    paste0(x, "\nn = ", n, " | Accuracy: ", sprintf("%.2f%%", acc * 100))
+  }))
+
+# Save the plot
+save_plot(norm_plot_by_contributor, "Sex_norm_plot_by_contributor.png", width = 15, height = 12)
+save_plot(norm_plot_by_contributor, "Sex_norm_plot_by_contributor.pdf", width = 15, height = 12)
+
+fwrite(accuracy_df,paste0(output_dir,"sex_prediction_accuracy_by_contributors.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+fwrite(complete_conf_df,paste0(output_dir,"sex_prediction_confusion_matrix_by_contributors.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+
+# Create summary by tissue type
+tissue_summary_df <- complete_conf_df %>%
+  mutate(tissue = gsub(" \\(.+", "", contributor_code)) %>%
+  group_by(Actual, tissue, Predicted) %>%
+  summarise(Count = sum(Count), .groups = "drop") %>%
+  group_by(Actual, tissue) %>%
+  mutate(Normalized = Count / sum(Count)) %>%
+  ungroup() %>%
+  mutate(Normalized = replace(Normalized, is.na(Normalized), 0))
+
+# Calculate accuracy per tissue
+tissue_accuracy_df <- tissue_summary_df %>%
+  group_by(tissue) %>%
+  summarise(
+    Correct = sum(Count[Actual == Predicted]),
+    Total = sum(Count),
+    Accuracy = Correct / Total,
+    .groups = "drop"
+  )
+
+# Plot by tissue with accuracy
+norm_plot_by_tissue <- ggplot(
+  tissue_summary_df %>% mutate(tissue = factor(tissue, levels = c("Plasma", "CSF"))),
+  aes(x = Predicted, y = Actual, fill = Normalized)
+) +
+  geom_tile(color = "white", size = 0.5) +
+  # Change text color based on darkness of fill
+  geom_text(aes(label = sprintf("%.2f", Normalized), 
+                color = ifelse(Normalized > 0.5, "white", "black")), 
+            size = 6) +
+  scale_fill_distiller(palette = color_palette, direction = 1, labels = percent_format()) +
+  # Add scale for text colors with no legend
+  scale_color_identity() +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 10)
+  ) +
+  labs(
+    title = "Row-Normalized Confusion Matrix by Tissue Type",
+    x = "Predicted sex",
+    y = "Actual sex",
+    fill = "Proportion"
+  ) +
+  facet_wrap(~tissue, labeller = labeller(tissue = function(x) {
+    acc <- tissue_accuracy_df$Accuracy[match(x, tissue_accuracy_df$tissue)]
+    n <- tissue_accuracy_df$Total[match(x, tissue_accuracy_df$tissue)]
+    paste0(x, "\nn = ", n, " | Accuracy: ", sprintf("%.2f%%", acc * 100))
+  }))
+# Save the plot
+save_plot(norm_plot_by_tissue, "Sex_norm_plot_by_tissue.png", width = 8, height = 4)
+save_plot(norm_plot_by_tissue, "Sex_norm_plot_by_tissue.pdf", width = 8, height = 4)
+fwrite(tissue_accuracy_df,paste0(output_dir,"sex_prediction_accuracy_by_tissue.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+fwrite(tissue_summary_df,paste0(output_dir,"sex_prediction_confusion_matrix_by_tissue.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+```
+
+
+## APOE Genotype Analysis
+
+Next, we'll analyze APOE genotype prediction accuracy across different contributors.
+
+```{r load-apoe-predictions}
+# Predicted APOE genotype (class labels of T0607)
+apoe_predictions <- get_class_labels(pp, "T0607")
+
+# Calculate APOE prediction accuracy by contributor
+apoe_acc_by_contributor <- data %>%
+  select(sample_id, APOE, contributor_code) %>%
+  inner_join(apoe_predictions, by = "sample_id") %>%
+  filter(!is.na(APOE)) %>%
+  filter(APOE != "-1") %>%
+  group_by(contributor_code) %>%
+  summarise(ACC = sum(APOE == prediction) / n())
+
+print("APOE Prediction Accuracy by Contributor:")
+print(apoe_acc_by_contributor)
+```
+
+### APOE Confusion Matrix Analysis
+
+Let's create comprehensive confusion matrices to visualize APOE prediction accuracy.
+
+```{r apoe-confusion-matrices}
+# Create the confusion matrix dataframe
+conf_norm_df <- data %>%
+  select(sample_id, APOE, contributor_code) %>%
+  inner_join(apoe_predictions, by = "sample_id") %>%
+  filter(!is.na(APOE)) %>%
+  filter(APOE != "-1") %>%
+  dplyr::rename(Actual = APOE, Predicted = prediction) %>%
+  group_by(contributor_code, Actual, Predicted) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(Actual, contributor_code) %>%
+  mutate(Normalized = Count / sum(Count)) %>%
+  ungroup()
+
+class_names <- unique(conf_norm_df$Actual)
+
+# Convert to factors with the right order
+conf_norm_df$Actual <- factor(conf_norm_df$Actual, levels = class_names)
+conf_norm_df$Predicted <- factor(conf_norm_df$Predicted, levels = class_names)
+
+# Create a complete grid with all combinations
+all_combinations <- expand.grid(
+  Actual = levels(conf_norm_df$Actual),
+  Predicted = levels(conf_norm_df$Actual),
+  contributor_code = unique(conf_norm_df$contributor_code),
+  stringsAsFactors = FALSE
+)
+
+# Convert to tibble for easier manipulation
+all_combinations <- as_tibble(all_combinations)
+
+# Join with existing data
+complete_conf_df <- left_join(
+  all_combinations,
+  conf_norm_df %>% select(Actual, Predicted, contributor_code, Count),
+  by = c("Actual", "Predicted", "contributor_code")
+)
+
+# Replace NA values with zeros for Count
+complete_conf_df <- complete_conf_df %>%
+  mutate(Count = ifelse(is.na(Count), 0, Count)) %>%
+  group_by(Actual, contributor_code) %>%
+  mutate(Normalized = Count / sum(Count)) %>%
+  ungroup() %>%
+  mutate(Normalized = replace(Normalized, is.na(Normalized), 0))
+
+# Define APOE genotype mapping for more readable labels
+apoe_map <- c(
+  "22" = "ε2/ε2",
+  "23" = "ε2/ε3",
+  "24" = "ε2/ε4",
+  "33" = "ε3/ε3",
+  "34" = "ε3/ε4",
+  "44" = "ε4/ε4"
+)
+
+# Apply the mapping
+complete_conf_df$Actual <- apoe_map[complete_conf_df$Actual]
+complete_conf_df$Predicted <- apoe_map[complete_conf_df$Predicted]
+
+# Format contributor codes for readability
+complete_conf_df$contributor_code <- complete_conf_df$contributor_code %>%
+  gsub(".+ ", "", .) %>%
+  gsub(".+_", "", .) %>%
+  paste0(., " (", complete_conf_df$contributor_code %>% gsub("_.+", "", .), ")")
+
+# Calculate accuracy per contributor
+accuracy_df <- complete_conf_df %>%
+  group_by(contributor_code) %>%
+  summarise(
+    Correct = sum(Count[Actual == Predicted]),
+    Total = sum(Count),
+    Accuracy = Correct / Total,
+    .groups = "drop"
+  )
+
+# Set color palette
+color_palette <- "Blues"
+```
+
+### APOE Confusion Matrix Visualization
+
+Now let's visualize the confusion matrices by contributor and tissue type.
+
+```{r apoe-confusion-matrix-plots}
+# Create ordered factor for proper display order
+contributor_levels <- c(
+  complete_conf_df$contributor_code %>% unique() %>% .[grepl("Plasma", .)],
+  complete_conf_df$contributor_code %>% unique() %>% .[grepl("CSF", .)]
+)
+
+# Create plot by contributor with n and accuracy in the facet labels
+norm_plot_by_contributor <- ggplot(
+  complete_conf_df %>% mutate(contributor_code = factor(contributor_code, levels = contributor_levels)),
+  aes(x = Predicted, y = Actual, fill = Normalized)
+) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", Normalized), 
+                color = ifelse(Normalized > 0.5, "white", "black")), 
+            size = 3) +
+  scale_fill_distiller(palette = color_palette, direction = 1, labels = percent_format()) +
+    scale_color_identity() +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 10)
+  ) +
+  labs(
+    title = "Row-Normalized Confusion Matrix (Recall Perspective)",
+    x = "Predicted APOE genotype",
+    y = "Actual APOE genotype",
+    fill = "Proportion"
+  ) +
+  facet_wrap(~contributor_code, labeller = labeller(contributor_code = function(x) {
+    acc <- accuracy_df$Accuracy[match(x, accuracy_df$contributor_code)]
+    n <- accuracy_df$Total[match(x, accuracy_df$contributor_code)]
+    paste0(x, "\nn = ", n, " | Accuracy: ", sprintf("%.2f%%", acc * 100))
+  }))
+
+# Save the plot
+save_plot(norm_plot_by_contributor, "APOE_norm_plot_by_contributor.png")
+save_plot(norm_plot_by_contributor, "APOE_norm_plot_by_contributor.pdf",device = cairo_pdf)
+
+fwrite(accuracy_df,paste0(output_dir,"apoe_prediction_accuracy_by_contributors.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+fwrite(complete_conf_df,paste0(output_dir,"apoe_prediction_confusion_matrix_by_contributors.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+
+# Create summary by tissue type
+tissue_summary_df <- complete_conf_df %>%
+  mutate(tissue = gsub(" \\(.+", "", contributor_code)) %>%
+  group_by(Actual, tissue, Predicted) %>%
+  summarise(Count = sum(Count), .groups = "drop") %>%
+  group_by(Actual, tissue) %>%
+  mutate(Normalized = Count / sum(Count)) %>%
+  ungroup() %>%
+  mutate(Normalized = replace(Normalized, is.na(Normalized), 0))
+
+# Calculate accuracy per tissue
+tissue_accuracy_df <- tissue_summary_df %>%
+  group_by(tissue) %>%
+  summarise(
+    Correct = sum(Count[Actual == Predicted]),
+    Total = sum(Count),
+    Accuracy = Correct / Total,
+    .groups = "drop"
+  )
+
+# Plot by tissue with accuracy
+norm_plot_by_tissue <- ggplot(
+  tissue_summary_df %>% mutate(tissue = factor(tissue, levels = c("Plasma", "CSF"))),
+  aes(x = Predicted, y = Actual, fill = Normalized)
+) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", Normalized), 
+                color = ifelse(Normalized > 0.5, "white", "black")), 
+            size = 3) +
+  scale_fill_distiller(palette = color_palette, direction = 1, labels = percent_format()) +
+    scale_color_identity() +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 10)
+  ) +
+  labs(
+    title = "Row-Normalized Confusion Matrix by Tissue Type",
+    x = "Predicted APOE genotype",
+    y = "Actual APOE genotype",
+    fill = "Proportion"
+  ) +
+  facet_wrap(~tissue, labeller = labeller(tissue = function(x) {
+    acc <- tissue_accuracy_df$Accuracy[match(x, tissue_accuracy_df$tissue)]
+    n <- tissue_accuracy_df$Total[match(x, tissue_accuracy_df$tissue)]
+    paste0(x, "\nn = ", n, " | Accuracy: ", sprintf("%.2f%%", acc * 100))
+  }))
+
+# Save the plot
+save_plot(norm_plot_by_tissue, "APOE_norm_plot_by_tissue.png", width = 8, height = 4)
+save_plot(norm_plot_by_tissue, "APOE_norm_plot_by_tissue.pdf", width = 8, height = 4,device = cairo_pdf)
+fwrite(tissue_accuracy_df,paste0(output_dir,"apoe_prediction_accuracy_by_tissue.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+fwrite(tissue_summary_df,paste0(output_dir,"apoe_prediction_confusion_matrix_by_tissue.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+```
+
+## Age Prediction Analysis
+
+Next, we'll analyze the accuracy of age prediction models across different contributors.
+
+```{r age-prediction-analysis}
+# Prepare data for age prediction analysis
+age_data <- data %>%
+  # Create more informative contributor labels
+  mutate(contributor_label = format_contributor_label(contributor_code)) %>%
+  # Filter out serum samples
+  filter(!grepl("Serum", contributor_code)) %>%
+  # Create ordered factor for proper display order
+  mutate(contributor_label = factor(
+    contributor_label,
+    levels = c(
+      unique(contributor_label) %>% sort() %>% .[grepl("Plasma", .)],
+      unique(contributor_label) %>% sort() %>% .[grepl("CSF", .)]
+    )
+  )) %>%
+  # Select relevant columns
+  select(sample_id, age_at_visit, contributor_label, T0001) %>%
+  # Remove missing or invalid age values
+  filter(!is.na(age_at_visit), age_at_visit != -1) %>%
+  # Calculate error metrics
+  mutate(abs_error = abs(T0001 - age_at_visit))
+
+# Create age prediction plot by contributor
+age_plot <- create_comparison_plot(
+  data = age_data,
+  x_var = "age_at_visit",
+  y_var = "T0001",
+  x_label = "Chronological Age (years)",
+  y_label = "Predicted Age (years)",
+  title = "Relationship Between Chronological and Predicted Age",
+  subtitle = "Analysis of age prediction accuracy across different contributor sources"
+)
+
+# Save the plot
+save_plot(age_plot, "Age_plot.png")
+save_plot(age_plot, "Age_plot.pdf")
+
+x_var = "age_at_visit"
+y_var = "T0001"
+stats_by_contributor <- age_data %>%
+  group_by(contributor_label) %>%
+  summarize(
+    rmse = sqrt(mean((!!sym(y_var) - !!sym(x_var))^2, na.rm = TRUE)),
+    mae = mean(abs(!!sym(y_var) - !!sym(x_var)), na.rm = TRUE),
+    cor = cor.test(!!sym(y_var), !!sym(x_var))$estimate,
+    cor_ci_lo = cor.test(!!sym(y_var), !!sym(x_var))$conf.int[1],
+    cor_ci_hi = cor.test(!!sym(y_var), !!sym(x_var))$conf.int[2],
+    cor_t = cor.test(!!sym(y_var), !!sym(x_var))$statistic,
+    cor_df = cor.test(!!sym(y_var), !!sym(x_var))$parameter,
+    cor_p = cor.test(!!sym(y_var), !!sym(x_var))$p.value,
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+fwrite(stats_by_contributor,paste0(output_dir,"age_prediction_accuracy_by_contributors.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+
+# Create age prediction plot by tissue type
+age_tissue_data <- age_data %>%
+  mutate(
+    tissue = gsub(" \\(.+", "", contributor_label),
+    tissue = factor(tissue, levels = c("Plasma", "CSF"))
+  )
+
+# Calculate statistics per tissue including sample size
+age_tissue_stats <- age_tissue_data %>%
+  group_by(tissue) %>%
+  summarize(
+    rmse = sqrt(mean((T0001 - age_at_visit)^2, na.rm = TRUE)),
+    mae = mean(abs(T0001 - age_at_visit), na.rm = TRUE),
+    cor = cor.test(!!sym(y_var), !!sym(x_var))$estimate,
+    cor_ci_lo = cor.test(!!sym(y_var), !!sym(x_var))$conf.int[1],
+    cor_ci_hi = cor.test(!!sym(y_var), !!sym(x_var))$conf.int[2],
+    cor_t = cor.test(!!sym(y_var), !!sym(x_var))$statistic,
+    cor_df = cor.test(!!sym(y_var), !!sym(x_var))$parameter,
+    cor_p = cor.test(!!sym(y_var), !!sym(x_var))$p.value,
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+
+
+age_tissue_plot <- ggplot(age_tissue_data, aes(x = age_at_visit, y = T0001)) +
+  geom_point(size = 0.8, alpha = 0.2, color = "gray30") +
+  geom_bin_2d(bins = 40, alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", size = 0.5) +
+  geom_smooth(method = "lm", color = "#0072B2", fill = "#0072B240", size = 1) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", 
+          size = 3, color = "black", digits = 2) +
+  geom_text(
+    data = age_tissue_stats,
+    aes(label = sprintf("n = %d\nRMSE: %.2f\nMAE: %.2f", n, rmse, mae)),
+    x = Inf, y = -Inf, hjust = 1.1, vjust = -0.8,
+    size = 3, color = "black", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ tissue, scales = "free", ncol = 2) +
+  scale_fill_viridis_c(option = "mako", name = "Count", direction = -1) +
+  scale_x_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+  scale_y_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", size = 0.2),
+    panel.border = element_rect(color = "gray70", fill = NA, size = 0.5),
+    strip.background = element_rect(fill = "gray95", color = "gray70"),
+    strip.text = element_text(face = "bold", size = 11),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    legend.key.size = unit(0.8, "lines"),
+    legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+    legend.box.margin = margin(t = -10),
+    axis.title = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    plot.caption = element_text(hjust = 0, size = 9, face = "italic"),
+    plot.margin = margin(t = 10, r = 15, b = 10, l = 10)
+  ) +
+  labs(
+    title = "Relationship Between Chronological and Predicted Age",
+    subtitle = paste0("Analysis by tissue type (Total n = ", sum(age_tissue_stats$n), ")"),
+    x = "Chronological Age (years)",
+    y = "Predicted Age (years)",
+    caption = "Note: Dashed line represents perfect prediction (y=x). Blue line shows linear regression with 95% confidence interval.
+    RMSE = Root Mean Square Error; MAE = Mean Absolute Error. Higher density of observations shown in darker colors."
+  )
+
+# Save the plot
+save_plot(age_tissue_plot, "Age_tissue_plot.png", width = 8, height = 5)
+save_plot(age_tissue_plot, "Age_tissue_plot.pdf", width = 8, height = 5)
+
+fwrite(age_tissue_stats,paste0(output_dir,"age_prediction_accuracy_by_tissue.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+```
+
+## MMSE Score Prediction Analysis
+
+Finally, we'll analyze the prediction of Mini-Mental State Exam (MMSE) scores.
+
+```{r mmse-prediction-analysis}
+# Prepare data for MMSE prediction analysis
+mmse_data <- data %>%
+  filter(cognitive_test_battery %in% "MMSE") %>%
+  select(sample_id, cognitive_test_score, contributor_code, T0019) %>%
+  filter(!is.na(cognitive_test_score)) %>%
+  filter(cognitive_test_score != -1) %>%
+  filter(cognitive_test_score < 31) %>%
+  filter(contributor_code != "K_EDTA Plasma") %>%
+  # Create more informative contributor labels
+  mutate(contributor_label = format_contributor_label(contributor_code)) %>%
+  # Filter out serum samples
+  filter(!grepl("Serum", contributor_code)) %>%
+  # Create ordered factor for proper display order
+  mutate(contributor_label = factor(
+    contributor_label,
+    levels = c(
+      unique(contributor_label) %>% sort() %>% .[grepl("Plasma", .)],
+      unique(contributor_label) %>% sort() %>% .[grepl("CSF", .)]
+    )
+  )) %>%
+  # Select relevant columns
+  select(sample_id, cognitive_test_score, contributor_label, T0019) %>%
+  # Calculate error metrics
+  mutate(abs_error = abs(T0019 - cognitive_test_score))
+
+
+# Create MMSE prediction plot by contributor
+mmse_plot <- create_comparison_plot(
+  data = mmse_data,
+  x_var = "cognitive_test_score",
+  y_var = "T0019",
+  x_label = "Mini-Mental State Exam",
+  y_label = "Predicted Mini-Mental State Exam",
+  title = "Relationship Between Actual and Predicted Mini-Mental State Exam"
+)
+
+# Save the plot
+save_plot(mmse_plot, "MMSE_plot.png")
+save_plot(mmse_plot, "MMSE_plot.pdf")
+
+
+x_var = "cognitive_test_score"
+y_var = "T0019"
+stats_by_contributor <- mmse_data %>%
+  group_by(contributor_label) %>%
+  summarize(
+    rmse = sqrt(mean((!!sym(y_var) - !!sym(x_var))^2, na.rm = TRUE)),
+    mae = mean(abs(!!sym(y_var) - !!sym(x_var)), na.rm = TRUE),
+    cor = cor.test(!!sym(y_var), !!sym(x_var))$estimate,
+    cor_ci_lo = cor.test(!!sym(y_var), !!sym(x_var))$conf.int[1],
+    cor_ci_hi = cor.test(!!sym(y_var), !!sym(x_var))$conf.int[2],
+    cor_t = cor.test(!!sym(y_var), !!sym(x_var))$statistic,
+    cor_df = cor.test(!!sym(y_var), !!sym(x_var))$parameter,
+    cor_p = cor.test(!!sym(y_var), !!sym(x_var))$p.value,
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+fwrite(stats_by_contributor,paste0(output_dir,"mmse_prediction_accuracy_by_contributors.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+
+
+# Create MMSE prediction plot by tissue type
+mmse_tissue_data <- mmse_data %>%
+  mutate(
+    tissue = gsub(" \\(.+", "", contributor_label),
+    tissue = factor(tissue, levels = c("Plasma", "CSF"))
+  )
+
+# Calculate statistics per tissue including sample size
+mmse_tissue_stats <- mmse_tissue_data %>%
+  group_by(tissue) %>%
+  summarize(
+    rmse = sqrt(mean((T0019 - cognitive_test_score)^2, na.rm = TRUE)),
+    mae = mean(abs(T0019 - cognitive_test_score), na.rm = TRUE),
+    cor = cor.test(T0019, cognitive_test_score)$estimate,
+    cor_ci_lo = cor.test(T0019, cognitive_test_score)$conf.int[1],
+    cor_ci_hi = cor.test(T0019, cognitive_test_score)$conf.int[2],
+    cor_t = cor.test(T0019, cognitive_test_score)$statistic,
+    cor_df = cor.test(T0019, cognitive_test_score)$parameter,
+    cor_p = cor.test(T0019, cognitive_test_score)$p.value,
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+
+# Create the plot with tissue-level statistics and sample counts
+mmse_tissue_plot <- ggplot(mmse_tissue_data, aes(x = cognitive_test_score, y = T0019)) +
+  geom_point(size = 0.8, alpha = 0.2, color = "gray30") +
+  geom_bin_2d(bins = 40, alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", size = 0.5) +
+  geom_smooth(method = "lm", color = "#0072B2", fill = "#0072B240", size = 1) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", 
+          size = 3, color = "black", digits = 2) +
+  geom_text(
+    data = mmse_tissue_stats,
+    aes(label = sprintf("n = %d\nRMSE: %.2f\nMAE: %.2f", n, rmse, mae)),
+    x = Inf, y = -Inf, hjust = 1.1, vjust = -0.8,
+    size = 3, color = "black", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ tissue, scales = "free", ncol = 2) +
+  scale_fill_viridis_c(option = "mako", name = "Count", direction = -1) +
+  scale_x_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+  scale_y_continuous(expand = c(0.02, 0.02), breaks = scales::pretty_breaks(n = 5)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", size = 0.2),
+    panel.border = element_rect(color = "gray70", fill = NA, size = 0.5),
+    strip.background = element_rect(fill = "gray95", color = "gray70"),
+    strip.text = element_text(face = "bold", size = 11),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    legend.key.size = unit(0.8, "lines"),
+    legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+    legend.box.margin = margin(t = -10),
+    axis.title = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    plot.caption = element_text(hjust = 0, size = 9, face = "italic"),
+    plot.margin = margin(t = 10, r = 15, b = 10, l = 10)
+  ) +
+  labs(
+    title = "Relationship Between Actual and Predicted Mini-Mental State Exam",
+    subtitle = paste0("Analysis by tissue type (Total n = ", sum(mmse_tissue_stats$n), ")"),
+    x = "Mini-Mental State Exam",
+    y = "Predicted Mini-Mental State Exam",
+    caption = "Note: Dashed line represents perfect prediction (y=x). Blue line shows linear regression with 95% confidence interval.
+    RMSE = Root Mean Square Error; MAE = Mean Absolute Error. Higher density of observations shown in darker colors."
+  )
+
+# Save the plot
+save_plot(mmse_tissue_plot, "MMSE_tissue_plot.png", width = 8, height = 5)
+save_plot(mmse_tissue_plot, "MMSE_tissue_plot.pdf", width = 8, height = 5)
+
+fwrite(mmse_tissue_stats,paste0(output_dir,"mmse_prediction_accuracy_by_tissue.txt"),
+       sep="\t",quote = F,row.names = F,col.names = T)
+```
+
+```{r plasma_csf_bar}
+
+fread(paste0(output_dir,"sex_prediction_accuracy_by_tissue.txt"))%>%
+  mutate(trait = "Sex")%>%
+  dplyr::select(tissue,trait,Accuracy)%>%
+  gather(key,value,-trait,-tissue) -> plot_ds
+fread(paste0(output_dir,"apoe_prediction_accuracy_by_tissue.txt"))%>%
+  mutate(trait = "APOE")%>%
+  dplyr::select(tissue,trait,Accuracy)%>%
+  gather(key,value,-trait,-tissue)%>%
+  bind_rows(.,plot_ds)-> plot_ds
+fread(paste0(output_dir,"age_prediction_accuracy_by_tissue.txt"))%>%
+  mutate(trait = "Age (r)")%>%
+  dplyr::select(tissue,trait,cor)%>%
+  gather(key,value,-trait,-tissue)%>%
+  bind_rows(.,plot_ds)-> plot_ds
+fread(paste0(output_dir,"mmse_prediction_accuracy_by_tissue.txt"))%>%
+  mutate(trait = "MMSE (r)")%>%
+  dplyr::select(tissue,trait,cor)%>%
+  gather(key,value,-trait,-tissue)%>%
+  bind_rows(.,plot_ds)-> plot_ds
+
+plot_ds = plot_ds%>%
+  mutate(trait=factor(trait,levels=c("MMSE (r)","APOE","Sex","Age (r)")))
+
+# Plot
+ggplot(plot_ds, aes(x = trait, y = value, fill = tissue)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(
+    aes(label = sprintf("%.2f", value)),
+    position = position_dodge(width = 0.7),
+    hjust = -0.2,
+    size = 3
+  ) +
+  scale_fill_manual(
+    values = c("Plasma" = "#2E86AB", "CSF" = "#A6A6A6"),
+    name = NULL
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08)), limits = c(0, 1.15)) +
+  coord_flip() +
+  labs(x = NULL, y = "Prediction accuracy") +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    legend.background = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.line = element_line(linewidth = 0.5)
+  ) -> p
+
+save_plot(p, "Combined_bar_plot.pdf", width = 3, height = 5)
+```
+
+## Extended Data Fig. 2 (per-site age and MMSE, final print size)
+
+One figure drawn at its final size, so all text is 5-7 pt (Nature artwork guide).
+Uses the same data as Age_plot / MMSE_plot.
+
+```{r ed2-figure}
+library(patchwork)
+
+ED2_W_MM <- 180; ED2_H_MM <- 175        # fits the 180 x 240 mm print area
+ED2_NCOL <- 7
+
+# per-site header: site, n, Pearson r, RMSE, MAE
+ed2_strip <- function(d, x_var, y_var) {
+  d %>%
+    group_by(contributor_label) %>%
+    summarize(
+      n    = dplyr::n(),
+      r    = cor(!!sym(y_var), !!sym(x_var)),
+      rmse = sqrt(mean((!!sym(y_var) - !!sym(x_var))^2)),
+      mae  = mean(abs(!!sym(y_var) - !!sym(x_var))),
+      .groups = "drop"
+    ) %>%
+    # RMSE/MAE to 1 decimal so the line fits the narrow panels (full values: Source Data)
+    mutate(strip = sprintf("%s\nn = %s, r = %.2f\nRMSE %.1f, MAE %.1f",
+                           contributor_label, formatC(n, big.mark = ",", format = "d"),
+                           r, rmse, mae))
+}
+
+ed2_panel <- function(d, x_var, y_var, x_lab, y_lab) {
+  s <- ed2_strip(d, x_var, y_var)
+  d <- d %>%
+    dplyr::select(contributor_label, all_of(c(x_var, y_var))) %>%
+    left_join(s %>% dplyr::select(contributor_label, strip), by = "contributor_label") %>%
+    mutate(strip = factor(strip, levels = s$strip[order(s$contributor_label)]))
+  ggplot(d, aes(x = !!sym(x_var), y = !!sym(y_var))) +
+    geom_bin_2d(bins = 30) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black", linewidth = 0.25) +
+    geom_smooth(method = "lm", formula = y ~ x, colour = "#0072B2", fill = "#0072B2",
+                alpha = 0.25, linewidth = 0.4) +
+    facet_wrap(~ strip, scales = "free", ncol = ED2_NCOL) +
+    scale_fill_viridis_c(option = "mako", direction = -1, name = "Count") +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 3)) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
+    labs(x = x_lab, y = y_lab) +
+    theme_minimal(base_size = 6, base_family = "Helvetica") +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "gray90", linewidth = 0.15),
+      panel.border = element_rect(colour = "gray70", fill = NA, linewidth = 0.25),
+      strip.text = element_text(size = 5, lineheight = 0.9, margin = margin(1, 0, 1, 0)),
+      axis.text = element_text(size = 5, colour = "black"),
+      axis.title = element_text(size = 6),
+      panel.spacing = unit(1.2, "mm"),
+      legend.title = element_text(size = 6), legend.text = element_text(size = 5),
+      legend.key.height = unit(5, "mm"), legend.key.width = unit(2.5, "mm")
+    )
+}
+
+ed2_a <- ed2_panel(age_data, "age_at_visit", "T0001",
+                   "Chronological age (years)", "Predicted age (years)")
+ed2_b <- ed2_panel(mmse_data, "cognitive_test_score", "T0019",
+                   "MMSE", "Predicted MMSE")
+
+ed2 <- (ed2_a / ed2_b) +
+  plot_layout(heights = c(3, 2)) +
+  plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(face = "bold", size = 8, family = "Helvetica"))
+
+# plain pdf device: vector, editable Helvetica text, no extra fonts needed on the AD Workbench
+ggsave(file.path(output_dir, "ED2_age_mmse_by_site.pdf"), ed2,
+       width = ED2_W_MM, height = ED2_H_MM, units = "mm", device = "pdf")
+ggsave(file.path(output_dir, "ED2_age_mmse_by_site.png"), ed2,
+       width = ED2_W_MM, height = ED2_H_MM, units = "mm", dpi = 300, bg = "white")
+```
+
+## Session Information
+
+The following section provides information about the R session used for this analysis, including the R version, operating system, and loaded packages. This information is essential for reproducibility.
+
+```{r session-info}
+# Display session information
+sessionInfo()
+```
